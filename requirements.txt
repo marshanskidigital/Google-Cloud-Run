@@ -1,0 +1,12 @@
+google-cloud-firestore==2.16.0
+google-cloud-tasks==2.15.0
+google-analytics-data==0.18.7
+google-auth==2.29.0
+requests==2.31.0
+
+Flask==3.*
+gunicorn==22.*
+
+google-ads==28.4.1
+protobuf>=4.25.0,<7
+grpcio>=1.59.0,<2
