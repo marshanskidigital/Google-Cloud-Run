@@ -10,6 +10,7 @@ from google.ads.googleads.errors import GoogleAdsException
 logging.basicConfig(level=logging.INFO)
 
 app = Flask(__name__)
+CORS(app)  # This adds CORS headers to all routes
 
 # -----------------------------
 # Config (ENV)
