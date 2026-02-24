@@ -173,8 +173,8 @@ def health():
 
 @app.get("/campaigns")
 def campaigns():
-    if not _require_auth():
-        return jsonify({"error": "Unauthorized"}), 401
+    # if not _require_auth():
+    #     return jsonify({"error": "Unauthorized"}), 401
 
     try:
         gads_client = _build_googleads_client()
