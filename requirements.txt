@@ -1,5 +1,5 @@
 Flask==3.*
-flask-cors==5.*
+flask-cors
 
 gunicorn==22.*
 requests==2.*
