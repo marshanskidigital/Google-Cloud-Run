@@ -1,4 +1,6 @@
 Flask==3.*
+flask-cors==5.*
+
 gunicorn==22.*
 requests==2.*
 google-auth==2.*
