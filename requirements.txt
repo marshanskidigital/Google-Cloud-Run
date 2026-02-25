@@ -11,7 +11,6 @@ anthropic>=0.39.0
 google-cloud-firestore==2.*
 google-cloud-tasks==2.*
 google-analytics-data==0.*
-google-analytics-admin==0.*
 
 google-api-core==2.*
 protobuf>=5.26.1,<7

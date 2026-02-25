@@ -14,7 +14,7 @@ from google.analytics.data_v1beta import BetaAnalyticsDataClient
 from google.analytics.data_v1beta.types import (
     RunReportRequest, DateRange, Metric, Dimension,
 )
-from google.analytics.admin_v1beta import AnalyticsAdminServiceClient
+
 
 logging.basicConfig(level=logging.INFO)
 
@@ -61,7 +61,14 @@ CLAUDE_SYSTEM_PROMPT = """You are a senior marketing strategist and growth exper
 You provide actionable, data-driven advice. When discussing strategies, you give specific steps and examples.
 You communicate clearly and professionally, using marketing terminology when appropriate.
 If the user shares campaign data or metrics, you analyze them and provide specific recommendations.
-Always respond in the same language the user writes in."""
+Always respond in the same language the user writes in.
+
+IMPORTANT: You may receive live Google Ads campaign data and/or Google Analytics data
+prepended to user messages. When this data is present, use it to provide specific,
+data-driven analysis and recommendations. Reference actual campaign names, metrics,
+and performance numbers in your answers. Calculate derived metrics like CTR, CPC,
+and conversion rates when relevant. Compare campaigns against each other and
+highlight top performers and underperformers."""
 
 # Firestore
 db = firestore.Client()
@@ -257,37 +264,20 @@ def campaigns():
 # Google Analytics Endpoints
 # -----------------------------------------------
 
-def _get_ga_admin_client() -> AnalyticsAdminServiceClient:
-    """Returns a GA Admin client using default service account credentials."""
-    return AnalyticsAdminServiceClient()
+def _get_ga_scoped_credentials():
+    """Get default credentials with explicit analytics scopes."""
+    import google.auth
+    scopes = [
+        "https://www.googleapis.com/auth/analytics.readonly",
+    ]
+    credentials, project = google.auth.default(scopes=scopes)
+    return credentials
 
 
 def _get_ga_data_client() -> BetaAnalyticsDataClient:
-    """Returns a GA Data client using default service account credentials."""
-    return BetaAnalyticsDataClient()
-
-
-def _list_ga_accounts() -> List[Dict[str, Any]]:
-    """List all GA4 account summaries (accounts + properties) the service account can access."""
-    admin_client = _get_ga_admin_client()
-    summaries = admin_client.list_account_summaries()
-
-    accounts = []
-    for summary in summaries:
-        props = []
-        for prop_summary in summary.property_summaries:
-            props.append({
-                "property": prop_summary.property,       # e.g. "properties/123456"
-                "property_id": prop_summary.property.split("/")[-1] if prop_summary.property else None,
-                "display_name": prop_summary.display_name,
-            })
-        accounts.append({
-            "account": summary.account,                  # e.g. "accounts/789"
-            "account_id": summary.account.split("/")[-1] if summary.account else None,
-            "display_name": summary.display_name,
-            "properties": props,
-        })
-    return accounts
+    """Returns a GA Data client with explicit analytics scopes."""
+    credentials = _get_ga_scoped_credentials()
+    return BetaAnalyticsDataClient(credentials=credentials)
 
 
 def _run_ga_report(property_id: str, days: int = 30) -> Dict[str, Any]:
@@ -380,14 +370,13 @@ def _get_ga_context_for_ai(property_id: str) -> str:
 
 @app.route("/analytics/accounts", methods=["GET", "OPTIONS"])
 def ga_accounts():
+    """Returns the hardcoded GA4 property IDs from GA_PROPERTY_IDS env var."""
     if request.method == "OPTIONS":
         return "", 204
-    try:
-        accounts = _list_ga_accounts()
-        return jsonify({"ok": True, "accounts": accounts})
-    except Exception as ex:
-        logging.exception("Failed /analytics/accounts")
-        return jsonify({"ok": False, "error": str(ex)}), 500
+    return jsonify({
+        "ok": True,
+        "property_ids": GA_PROPERTY_IDS,
+    })
 
 
 @app.route("/analytics/report/<property_id>", methods=["GET", "OPTIONS"])
@@ -402,6 +391,118 @@ def ga_report(property_id):
     except Exception as ex:
         logging.exception("Failed /analytics/report/%s", property_id)
         return jsonify({"ok": False, "error": str(ex)}), 500
+
+
+# -----------------------------------------------
+# Google Ads Context for AI
+# -----------------------------------------------
+
+def _get_google_ads_context_for_ai(customer_ids: Optional[List[str]] = None) -> str:
+    """
+    Fetch Google Ads campaign data and format it as text context for Claude.
+    If customer_ids is provided, fetch only those accounts.
+    Otherwise, fetch all child accounts under the MCC.
+    """
+    try:
+        gads_client = _build_googleads_client()
+
+        # Determine which accounts to fetch
+        if customer_ids:
+            accounts = [{"customer_id": cid.replace("-", "").strip(), "name": None, "status": None} for cid in customer_ids]
+        else:
+            accounts = _list_direct_child_accounts(gads_client)
+
+        if not accounts:
+            return "[No Google Ads accounts found under this MCC.]"
+
+        context_lines = [
+            "=== Google Ads Campaign Data (Last 30 Days) ===",
+            f"Accounts loaded: {len(accounts)}",
+            "",
+        ]
+
+        grand_totals = {"impressions": 0, "clicks": 0, "cost": 0.0, "conversions": 0.0}
+
+        for acc in accounts:
+            cid = acc["customer_id"]
+            acc_name = acc.get("name") or cid
+            context_lines.append(f"--- Account: {acc_name} (ID: {cid}) ---")
+
+            campaigns = _fetch_campaigns_for_account(gads_client, cid)
+
+            # Check for error responses
+            if campaigns and "error" in campaigns[0]:
+                err_msg = campaigns[0]["error"].get("message", "Unknown error")
+                context_lines.append(f"  [Error fetching campaigns: {err_msg}]")
+                context_lines.append("")
+                continue
+
+            if not campaigns:
+                context_lines.append("  No campaigns found.")
+                context_lines.append("")
+                continue
+
+            acc_totals = {"impressions": 0, "clicks": 0, "cost": 0.0, "conversions": 0.0}
+
+            for c in campaigns:
+                impressions = c.get("impressions", 0)
+                clicks = c.get("clicks", 0)
+                cost = c.get("cost", 0.0)
+                conversions = c.get("conversions", 0.0)
+                ctr = (clicks / impressions * 100) if impressions > 0 else 0.0
+                cpc = (cost / clicks) if clicks > 0 else 0.0
+
+                context_lines.append(
+                    f"  Campaign: {c.get('campaign_name', '?')} | "
+                    f"Status: {c.get('campaign_status', '?')} | "
+                    f"Type: {c.get('channel_type', '?')} | "
+                    f"Impr: {impressions:,} | "
+                    f"Clicks: {clicks:,} | "
+                    f"CTR: {ctr:.2f}% | "
+                    f"Cost: ₪{cost:,.2f} | "
+                    f"CPC: ₪{cpc:.2f} | "
+                    f"Conv: {conversions:.1f}"
+                )
+
+                acc_totals["impressions"] += impressions
+                acc_totals["clicks"] += clicks
+                acc_totals["cost"] += cost
+                acc_totals["conversions"] += conversions
+
+            # Account totals
+            acc_ctr = (acc_totals["clicks"] / acc_totals["impressions"] * 100) if acc_totals["impressions"] > 0 else 0.0
+            acc_cpc = (acc_totals["cost"] / acc_totals["clicks"]) if acc_totals["clicks"] > 0 else 0.0
+            context_lines.append(
+                f"  ACCOUNT TOTAL: Impr: {acc_totals['impressions']:,} | "
+                f"Clicks: {acc_totals['clicks']:,} | "
+                f"CTR: {acc_ctr:.2f}% | "
+                f"Cost: ₪{acc_totals['cost']:,.2f} | "
+                f"CPC: ₪{acc_cpc:.2f} | "
+                f"Conv: {acc_totals['conversions']:.1f}"
+            )
+            context_lines.append("")
+
+            # Add to grand totals
+            for k in grand_totals:
+                grand_totals[k] += acc_totals[k]
+
+        # Grand totals across all accounts
+        grand_ctr = (grand_totals["clicks"] / grand_totals["impressions"] * 100) if grand_totals["impressions"] > 0 else 0.0
+        grand_cpc = (grand_totals["cost"] / grand_totals["clicks"]) if grand_totals["clicks"] > 0 else 0.0
+        context_lines.append(
+            f"GRAND TOTAL (All Accounts): Impr: {grand_totals['impressions']:,} | "
+            f"Clicks: {grand_totals['clicks']:,} | "
+            f"CTR: {grand_ctr:.2f}% | "
+            f"Cost: ₪{grand_totals['cost']:,.2f} | "
+            f"CPC: ₪{grand_cpc:.2f} | "
+            f"Conv: {grand_totals['conversions']:.1f}"
+        )
+        context_lines.append("=== End of Google Ads Data ===")
+        return "\n".join(context_lines)
+
+    except Exception as ex:
+        logging.exception("Failed to fetch Google Ads context for AI")
+        return f"[Could not fetch Google Ads data: {str(ex)}]"
 
 
 # -----------------------------------------------
@@ -448,14 +549,28 @@ def ai_chat():
         user_message = body.get("message", "").strip()
         conversation_id = body.get("conversation_id")
         ga_property_id = body.get("ga_property_id")  # optional GA4 property
+        include_google_ads = body.get("include_google_ads", False)  # pull Google Ads data
+        google_ads_customer_ids = body.get("google_ads_customer_ids")  # optional list of account IDs
 
         if not user_message:
             return jsonify({"ok": False, "error": "'message' is required"}), 400
 
-        # If a GA property ID is provided, fetch data and prepend as context
-        ga_context = ""
+        # --- Build data context blocks ---
+        context_parts = []
+
+        # Google Ads context
+        if include_google_ads or google_ads_customer_ids:
+            ads_context = _get_google_ads_context_for_ai(
+                customer_ids=google_ads_customer_ids if google_ads_customer_ids else None
+            )
+            if ads_context:
+                context_parts.append(ads_context)
+
+        # Google Analytics context
         if ga_property_id:
             ga_context = _get_ga_context_for_ai(str(ga_property_id))
+            if ga_context:
+                context_parts.append(ga_context)
 
         # Get or create conversation
         if conversation_id:
@@ -477,10 +592,11 @@ def ai_chat():
                 "content": msg["content"],
             })
 
-        # Add the new user message, enriched with GA data if available
+        # Add the new user message, enriched with data context if available
         enriched_message = user_message
-        if ga_context:
-            enriched_message = f"{ga_context}\n\nUser question: {user_message}"
+        if context_parts:
+            context_block = "\n\n".join(context_parts)
+            enriched_message = f"{context_block}\n\nUser question: {user_message}"
         messages_for_claude.append({"role": "user", "content": enriched_message})
 
         # Call Claude
