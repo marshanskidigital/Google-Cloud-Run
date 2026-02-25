@@ -6,6 +6,7 @@ from typing import Dict, Any, List, Optional
 from datetime import datetime, timezone
 
 from flask import Flask, request, jsonify
+from flask_cors import CORS
 from google.ads.googleads.client import GoogleAdsClient
 from google.ads.googleads.errors import GoogleAdsException
 import anthropic
@@ -19,13 +20,7 @@ from google.analytics.data_v1beta.types import (
 logging.basicConfig(level=logging.INFO)
 
 app = Flask(__name__)
-
-@app.after_request
-def add_cors(response):
-    response.headers['Access-Control-Allow-Origin'] = '*'
-    response.headers['Access-Control-Allow-Methods'] = 'GET, POST, DELETE, OPTIONS'
-    response.headers['Access-Control-Allow-Headers'] = 'Content-Type, auth-key'
-    return response
+CORS(app)
 
 
 # -----------------------------
