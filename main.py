@@ -10,7 +10,14 @@ from google.ads.googleads.errors import GoogleAdsException
 logging.basicConfig(level=logging.INFO)
 
 app = Flask(__name__)
-CORS(app)  # This adds CORS headers to all routes
+
+@app.after_request
+def add_cors(response):
+    response.headers['Access-Control-Allow-Origin'] = '*'
+    response.headers['Access-Control-Allow-Methods'] = 'GET, OPTIONS'
+    response.headers['Access-Control-Allow-Headers'] = 'Content-Type'
+    return response
+
 
 # -----------------------------
 # Config (ENV)
