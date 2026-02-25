@@ -6,6 +6,8 @@ google-auth==2.*
 
 google-ads==28.4.1
 
+anthropic>=0.39.0
+
 google-cloud-firestore==2.*
 google-cloud-tasks==2.*
 google-analytics-data==0.*

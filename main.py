@@ -1,11 +1,15 @@
 import os
 import json
+import uuid
 import logging
 from typing import Dict, Any, List
+from datetime import datetime, timezone
 
 from flask import Flask, request, jsonify
 from google.ads.googleads.client import GoogleAdsClient
 from google.ads.googleads.errors import GoogleAdsException
+import anthropic
+from google.cloud import firestore
 
 logging.basicConfig(level=logging.INFO)
 
@@ -14,8 +18,8 @@ app = Flask(__name__)
 @app.after_request
 def add_cors(response):
     response.headers['Access-Control-Allow-Origin'] = '*'
-    response.headers['Access-Control-Allow-Methods'] = 'GET, OPTIONS'
-    response.headers['Access-Control-Allow-Headers'] = 'Content-Type'
+    response.headers['Access-Control-Allow-Methods'] = 'GET, POST, DELETE, OPTIONS'
+    response.headers['Access-Control-Allow-Headers'] = 'Content-Type, auth-key'
     return response
 
 
@@ -35,6 +39,28 @@ GOOGLE_ADS_MCC_ID = os.getenv("GOOGLE_ADS_MCC_ID")
 # הגבלות כדי לא להיתקע על TIMEOUT
 MAX_ACCOUNTS = int(os.getenv("MAX_ACCOUNTS", "50"))                 # כמה חשבונות למשוך מתחת ל-MCC
 MAX_CAMPAIGNS_PER_ACCOUNT = int(os.getenv("MAX_CAMPAIGNS_PER_ACCOUNT", "200"))  # כמה קמפיינים לכל חשבון
+
+# Claude AI (Anthropic)
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
+CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-opus-4-20250514")
+CLAUDE_MAX_TOKENS = int(os.getenv("CLAUDE_MAX_TOKENS", "4096"))
+
+CLAUDE_SYSTEM_PROMPT = """You are a senior marketing strategist and growth expert. You specialize in:
+- Google Ads campaign strategy, optimization, and performance analysis
+- SEO and content marketing
+- Lead generation and CRM strategies
+- Growth hacking and conversion rate optimization
+- Marketing analytics and data-driven decision making
+- Budget allocation and ROI optimization
+
+You provide actionable, data-driven advice. When discussing strategies, you give specific steps and examples.
+You communicate clearly and professionally, using marketing terminology when appropriate.
+If the user shares campaign data or metrics, you analyze them and provide specific recommendations.
+Always respond in the same language the user writes in."""
+
+# Firestore
+db = firestore.Client()
+CONVERSATIONS_COLLECTION = "conversations"
 
 
 def _require_auth() -> bool:
@@ -215,6 +241,189 @@ def campaigns():
 
     except Exception as ex:
         logging.exception("Failed /campaigns")
+        return jsonify({"ok": False, "error": str(ex)}), 500
+
+
+# -----------------------------------------------
+# Claude AI Chat Endpoints
+# -----------------------------------------------
+
+def _get_anthropic_client() -> anthropic.Anthropic:
+    if not ANTHROPIC_API_KEY:
+        raise RuntimeError("Missing ANTHROPIC_API_KEY environment variable")
+    return anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+
+
+def _get_conversation_ref(conversation_id: str):
+    return db.collection(CONVERSATIONS_COLLECTION).document(conversation_id)
+
+
+def _create_conversation(title: str = "New Conversation") -> Dict[str, Any]:
+    conv_id = str(uuid.uuid4())
+    now = datetime.now(timezone.utc).isoformat()
+    doc = {
+        "id": conv_id,
+        "title": title,
+        "created_at": now,
+        "updated_at": now,
+        "messages": [],
+    }
+    _get_conversation_ref(conv_id).set(doc)
+    return doc
+
+
+def _auto_title(message: str) -> str:
+    """Create a short title from the first user message."""
+    title = message.strip().replace("\n", " ")
+    return title[:80] + ("..." if len(title) > 80 else "")
+
+
+@app.route("/ai-chat", methods=["POST", "OPTIONS"])
+def ai_chat():
+    if request.method == "OPTIONS":
+        return "", 204
+
+    try:
+        body = request.get_json(force=True)
+        user_message = body.get("message", "").strip()
+        conversation_id = body.get("conversation_id")
+
+        if not user_message:
+            return jsonify({"ok": False, "error": "'message' is required"}), 400
+
+        # Get or create conversation
+        if conversation_id:
+            conv_ref = _get_conversation_ref(conversation_id)
+            conv_doc = conv_ref.get()
+            if not conv_doc.exists:
+                return jsonify({"ok": False, "error": f"Conversation {conversation_id} not found"}), 404
+            conv_data = conv_doc.to_dict()
+        else:
+            conv_data = _create_conversation(title=_auto_title(user_message))
+            conversation_id = conv_data["id"]
+            conv_ref = _get_conversation_ref(conversation_id)
+
+        # Build messages array for Claude (from history)
+        messages_for_claude = []
+        for msg in conv_data.get("messages", []):
+            messages_for_claude.append({
+                "role": msg["role"],
+                "content": msg["content"],
+            })
+        # Add the new user message
+        messages_for_claude.append({"role": "user", "content": user_message})
+
+        # Call Claude
+        client = _get_anthropic_client()
+        response = client.messages.create(
+            model=CLAUDE_MODEL,
+            max_tokens=CLAUDE_MAX_TOKENS,
+            system=CLAUDE_SYSTEM_PROMPT,
+            messages=messages_for_claude,
+        )
+
+        assistant_message = response.content[0].text
+
+        # Update Firestore with both messages
+        now = datetime.now(timezone.utc).isoformat()
+        conv_ref.update({
+            "updated_at": now,
+            "messages": firestore.ArrayUnion([
+                {"role": "user", "content": user_message, "timestamp": now},
+                {"role": "assistant", "content": assistant_message, "timestamp": now},
+            ]),
+        })
+
+        return jsonify({
+            "ok": True,
+            "conversation_id": conversation_id,
+            "response": assistant_message,
+            "model": CLAUDE_MODEL,
+            "usage": {
+                "input_tokens": response.usage.input_tokens,
+                "output_tokens": response.usage.output_tokens,
+            },
+        })
+
+    except Exception as ex:
+        logging.exception("Failed /ai-chat")
+        return jsonify({"ok": False, "error": str(ex)}), 500
+
+
+@app.route("/ai-chat/conversations", methods=["GET", "OPTIONS"])
+def list_conversations():
+    if request.method == "OPTIONS":
+        return "", 204
+
+    try:
+        query = (
+            db.collection(CONVERSATIONS_COLLECTION)
+            .order_by("updated_at", direction=firestore.Query.DESCENDING)
+            .limit(50)
+        )
+        docs = query.stream()
+
+        conversations = []
+        for doc in docs:
+            d = doc.to_dict()
+            conversations.append({
+                "id": d.get("id"),
+                "title": d.get("title"),
+                "created_at": d.get("created_at"),
+                "updated_at": d.get("updated_at"),
+                "message_count": len(d.get("messages", [])),
+            })
+
+        return jsonify({"ok": True, "conversations": conversations})
+
+    except Exception as ex:
+        logging.exception("Failed /ai-chat/conversations")
+        return jsonify({"ok": False, "error": str(ex)}), 500
+
+
+@app.route("/ai-chat/history/<conversation_id>", methods=["GET", "OPTIONS"])
+def get_conversation_history(conversation_id):
+    if request.method == "OPTIONS":
+        return "", 204
+
+    try:
+        doc = _get_conversation_ref(conversation_id).get()
+        if not doc.exists:
+            return jsonify({"ok": False, "error": "Conversation not found"}), 404
+
+        d = doc.to_dict()
+        return jsonify({
+            "ok": True,
+            "conversation": {
+                "id": d.get("id"),
+                "title": d.get("title"),
+                "created_at": d.get("created_at"),
+                "updated_at": d.get("updated_at"),
+                "messages": d.get("messages", []),
+            },
+        })
+
+    except Exception as ex:
+        logging.exception("Failed /ai-chat/history")
+        return jsonify({"ok": False, "error": str(ex)}), 500
+
+
+@app.route("/ai-chat/conversations/<conversation_id>", methods=["DELETE", "OPTIONS"])
+def delete_conversation(conversation_id):
+    if request.method == "OPTIONS":
+        return "", 204
+
+    try:
+        ref = _get_conversation_ref(conversation_id)
+        doc = ref.get()
+        if not doc.exists:
+            return jsonify({"ok": False, "error": "Conversation not found"}), 404
+
+        ref.delete()
+        return jsonify({"ok": True, "deleted": conversation_id})
+
+    except Exception as ex:
+        logging.exception("Failed DELETE /ai-chat/conversations")
         return jsonify({"ok": False, "error": str(ex)}), 500
 
 
