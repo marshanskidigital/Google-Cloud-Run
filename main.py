@@ -519,8 +519,9 @@ def _get_conversation_ref(conversation_id: str):
     return db.collection(CONVERSATIONS_COLLECTION).document(conversation_id)
 
 
-def _create_conversation(title: str = "New Conversation") -> Dict[str, Any]:
-    conv_id = str(uuid.uuid4())
+def _create_conversation(title: str = "New Conversation", conv_id: Optional[str] = None) -> Dict[str, Any]:
+    if not conv_id:
+        conv_id = str(uuid.uuid4())
     now = datetime.now(timezone.utc).isoformat()
     doc = {
         "id": conv_id,
@@ -577,8 +578,9 @@ def ai_chat():
             conv_ref = _get_conversation_ref(conversation_id)
             conv_doc = conv_ref.get()
             if not conv_doc.exists:
-                return jsonify({"ok": False, "error": f"Conversation {conversation_id} not found"}), 404
-            conv_data = conv_doc.to_dict()
+                conv_data = _create_conversation(title=_auto_title(user_message), conv_id=conversation_id)
+            else:
+                conv_data = conv_doc.to_dict()
         else:
             conv_data = _create_conversation(title=_auto_title(user_message))
             conversation_id = conv_data["id"]
