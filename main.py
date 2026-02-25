@@ -2,7 +2,7 @@ import os
 import json
 import uuid
 import logging
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 from datetime import datetime, timezone
 
 from flask import Flask, request, jsonify
@@ -10,6 +10,11 @@ from google.ads.googleads.client import GoogleAdsClient
 from google.ads.googleads.errors import GoogleAdsException
 import anthropic
 from google.cloud import firestore
+from google.analytics.data_v1beta import BetaAnalyticsDataClient
+from google.analytics.data_v1beta.types import (
+    RunReportRequest, DateRange, Metric, Dimension,
+)
+from google.analytics.admin_v1beta import AnalyticsAdminServiceClient
 
 logging.basicConfig(level=logging.INFO)
 
@@ -61,6 +66,10 @@ Always respond in the same language the user writes in."""
 # Firestore
 db = firestore.Client()
 CONVERSATIONS_COLLECTION = "conversations"
+
+# Google Analytics
+# Optional comma-separated list of GA4 property IDs for quick access
+GA_PROPERTY_IDS = [p.strip() for p in os.getenv("GA_PROPERTY_IDS", "").split(",") if p.strip()]
 
 
 def _require_auth() -> bool:
@@ -245,6 +254,157 @@ def campaigns():
 
 
 # -----------------------------------------------
+# Google Analytics Endpoints
+# -----------------------------------------------
+
+def _get_ga_admin_client() -> AnalyticsAdminServiceClient:
+    """Returns a GA Admin client using default service account credentials."""
+    return AnalyticsAdminServiceClient()
+
+
+def _get_ga_data_client() -> BetaAnalyticsDataClient:
+    """Returns a GA Data client using default service account credentials."""
+    return BetaAnalyticsDataClient()
+
+
+def _list_ga_accounts() -> List[Dict[str, Any]]:
+    """List all GA4 account summaries (accounts + properties) the service account can access."""
+    admin_client = _get_ga_admin_client()
+    summaries = admin_client.list_account_summaries()
+
+    accounts = []
+    for summary in summaries:
+        props = []
+        for prop_summary in summary.property_summaries:
+            props.append({
+                "property": prop_summary.property,       # e.g. "properties/123456"
+                "property_id": prop_summary.property.split("/")[-1] if prop_summary.property else None,
+                "display_name": prop_summary.display_name,
+            })
+        accounts.append({
+            "account": summary.account,                  # e.g. "accounts/789"
+            "account_id": summary.account.split("/")[-1] if summary.account else None,
+            "display_name": summary.display_name,
+            "properties": props,
+        })
+    return accounts
+
+
+def _run_ga_report(property_id: str, days: int = 30) -> Dict[str, Any]:
+    """
+    Run a summary report for a GA4 property.
+    Returns sessions, active users, screen page views, conversions,
+    bounce rate — grouped by date.
+    """
+    data_client = _get_ga_data_client()
+
+    req = RunReportRequest(
+        property=f"properties/{property_id}",
+        date_ranges=[DateRange(start_date=f"{days}daysAgo", end_date="today")],
+        dimensions=[Dimension(name="date")],
+        metrics=[
+            Metric(name="sessions"),
+            Metric(name="activeUsers"),
+            Metric(name="screenPageViews"),
+            Metric(name="conversions"),
+            Metric(name="bounceRate"),
+        ],
+    )
+
+    response = data_client.run_report(req)
+
+    rows = []
+    metric_headers = [h.name for h in response.metric_headers]
+    for row in response.rows:
+        row_data = {"date": row.dimension_values[0].value}
+        for i, metric_val in enumerate(row.metric_values):
+            row_data[metric_headers[i]] = metric_val.value
+        rows.append(row_data)
+
+    # Sort by date ascending
+    rows.sort(key=lambda r: r["date"])
+
+    # Calculate totals from the response totals
+    totals = {}
+    if response.totals:
+        for i, metric_val in enumerate(response.totals[0].metric_values):
+            totals[metric_headers[i]] = metric_val.value
+
+    return {
+        "property_id": property_id,
+        "date_range": f"last {days} days",
+        "row_count": len(rows),
+        "totals": totals,
+        "rows": rows,
+    }
+
+
+def _get_ga_context_for_ai(property_id: str) -> str:
+    """Fetch GA report data and format it as text context for Claude."""
+    try:
+        report = _run_ga_report(property_id, days=30)
+        totals = report.get("totals", {})
+
+        context_lines = [
+            f"=== Google Analytics Data (Property {property_id}, Last 30 Days) ===",
+            f"Total Sessions: {totals.get('sessions', 'N/A')}",
+            f"Total Active Users: {totals.get('activeUsers', 'N/A')}",
+            f"Total Page Views: {totals.get('screenPageViews', 'N/A')}",
+            f"Total Conversions: {totals.get('conversions', 'N/A')}",
+            f"Average Bounce Rate: {totals.get('bounceRate', 'N/A')}",
+            "",
+            "Daily breakdown (last 10 days):",
+        ]
+
+        # Show last 10 days for brevity
+        recent_rows = report["rows"][-10:]
+        for row in recent_rows:
+            date_str = row['date']
+            formatted_date = f"{date_str[:4]}-{date_str[4:6]}-{date_str[6:]}"
+            context_lines.append(
+                f"  {formatted_date}: "
+                f"Sessions={row.get('sessions', '?')}, "
+                f"Users={row.get('activeUsers', '?')}, "
+                f"PageViews={row.get('screenPageViews', '?')}, "
+                f"Conversions={row.get('conversions', '?')}, "
+                f"BounceRate={row.get('bounceRate', '?')}"
+            )
+
+        context_lines.append("=== End of GA Data ===")
+        return "\n".join(context_lines)
+
+    except Exception as ex:
+        logging.exception("Failed to fetch GA context for property %s", property_id)
+        return f"[Could not fetch GA data for property {property_id}: {str(ex)}]"
+
+
+@app.route("/analytics/accounts", methods=["GET", "OPTIONS"])
+def ga_accounts():
+    if request.method == "OPTIONS":
+        return "", 204
+    try:
+        accounts = _list_ga_accounts()
+        return jsonify({"ok": True, "accounts": accounts})
+    except Exception as ex:
+        logging.exception("Failed /analytics/accounts")
+        return jsonify({"ok": False, "error": str(ex)}), 500
+
+
+@app.route("/analytics/report/<property_id>", methods=["GET", "OPTIONS"])
+def ga_report(property_id):
+    if request.method == "OPTIONS":
+        return "", 204
+    try:
+        days = int(request.args.get("days", "30"))
+        days = max(1, min(days, 365))  # clamp to 1-365
+        report = _run_ga_report(property_id, days=days)
+        return jsonify({"ok": True, **report})
+    except Exception as ex:
+        logging.exception("Failed /analytics/report/%s", property_id)
+        return jsonify({"ok": False, "error": str(ex)}), 500
+
+
+# -----------------------------------------------
 # Claude AI Chat Endpoints
 # -----------------------------------------------
 
@@ -287,9 +447,15 @@ def ai_chat():
         body = request.get_json(force=True)
         user_message = body.get("message", "").strip()
         conversation_id = body.get("conversation_id")
+        ga_property_id = body.get("ga_property_id")  # optional GA4 property
 
         if not user_message:
             return jsonify({"ok": False, "error": "'message' is required"}), 400
+
+        # If a GA property ID is provided, fetch data and prepend as context
+        ga_context = ""
+        if ga_property_id:
+            ga_context = _get_ga_context_for_ai(str(ga_property_id))
 
         # Get or create conversation
         if conversation_id:
@@ -310,8 +476,12 @@ def ai_chat():
                 "role": msg["role"],
                 "content": msg["content"],
             })
-        # Add the new user message
-        messages_for_claude.append({"role": "user", "content": user_message})
+
+        # Add the new user message, enriched with GA data if available
+        enriched_message = user_message
+        if ga_context:
+            enriched_message = f"{ga_context}\n\nUser question: {user_message}"
+        messages_for_claude.append({"role": "user", "content": enriched_message})
 
         # Call Claude
         client = _get_anthropic_client()
