@@ -17,3 +17,5 @@ google-api-core==2.*
 protobuf>=5.26.1,<7
 grpcio>=1.59.0,<2
 grpcio-status>=1.59.0,<2
+
+google-api-python-client==2.*

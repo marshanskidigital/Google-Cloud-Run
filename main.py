@@ -15,6 +15,9 @@ from google.analytics.data_v1beta import BetaAnalyticsDataClient
 from google.analytics.data_v1beta.types import (
     RunReportRequest, DateRange, Metric, Dimension,
 )
+from googleapiclient.discovery import build
+import google.auth
+from datetime import timedelta
 
 
 logging.basicConfig(level=logging.INFO)
@@ -56,23 +59,14 @@ CLAUDE_MAX_TOKENS = int(os.getenv("CLAUDE_MAX_TOKENS", "4096"))
 
 CLAUDE_SYSTEM_PROMPT = """You are a senior marketing strategist and growth expert. You specialize in:
 - Google Ads campaign strategy, optimization, and performance analysis
-- SEO and content marketing
+- SEO and organic search performance (Google Search Console data)
 - Lead generation and CRM strategies
-- Growth hacking and conversion rate optimization
-- Marketing analytics and data-driven decision making
-- Budget allocation and ROI optimization
+- Conversion rate optimization (CRO)
+- Cross-channel marketing analysis (comparing Paid vs. Organic performance)
 
-You provide actionable, data-driven advice. When discussing strategies, you give specific steps and examples.
-You communicate clearly and professionally, using marketing terminology when appropriate.
-If the user shares campaign data or metrics, you analyze them and provide specific recommendations.
-Always respond in the same language the user writes in.
-
-IMPORTANT: You may receive live Google Ads campaign data and/or Google Analytics data
-prepended to user messages. When this data is present, use it to provide specific,
-data-driven analysis and recommendations. Reference actual campaign names, metrics,
-and performance numbers in your answers. Calculate derived metrics like CTR, CPC,
-and conversion rates when relevant. Compare campaigns against each other and
-highlight top performers and underperformers."""
+When provided with data context (Google Ads, Google Analytics, Google Search Console), analyze it deeply to provide actionable insights. If you see organic search data, use it to inform your paid strategy (e.g., "this page ranks well organically, let's use it as a landing page for ads").
+Always answer in the language the user speaks to you (usually Hebrew).
+Keep answers concise, professional, and directly useful."""
 
 # Firestore
 db = firestore.Client()
@@ -399,6 +393,83 @@ def ga_report(property_id):
 
 
 # -----------------------------------------------
+# Google Search Console Context for AI
+# -----------------------------------------------
+
+def _get_gsc_context_for_ai(site_url: str) -> str:
+    """
+    Fetch Google Search Console performance data and format it for Claude.
+    Extracts Top 5 Queries, Pages, Query+Page Matrix, and Country break-downs.
+    """
+    try:
+        credentials, project = google.auth.default(scopes=['https://www.googleapis.com/auth/webmasters.readonly'])
+        # Build the GSC service
+        service = build('searchconsole', 'v1', credentials=credentials)
+
+        # Calculate dates (last 30 days)
+        end_date = datetime.now(timezone.utc).date() - timedelta(days=2) # GSC data typically has a 2-day lag
+        start_date = end_date - timedelta(days=30)
+        
+        start_date_str = start_date.strftime('%Y-%m-%d')
+        end_date_str = end_date.strftime('%Y-%m-%d')
+
+        context_lines = [
+            f"=== Google Search Console (SEO) Data for {site_url} ===",
+            f"Date Range: {start_date_str} to {end_date_str}",
+            ""
+        ]
+
+        def _query_gsc(dimensions: List[str], row_limit: int = 5) -> List[Dict]:
+            request = {
+                'startDate': start_date_str,
+                'endDate': end_date_str,
+                'dimensions': dimensions,
+                'rowLimit': row_limit
+            }
+            response = service.searchanalytics().query(siteUrl=site_url, body=request).execute()
+            return response.get('rows', [])
+
+        # 1. Top 15 Queries
+        top_queries = _query_gsc(['query'], 15)
+        if top_queries:
+            context_lines.append("--- Top 15 Organic Search Queries ---")
+            for r in top_queries:
+                context_lines.append(f"Query: '{r['keys'][0]}' | Clicks: {r['clicks']} | Imp: {r['impressions']} | CTR: {r['ctr'] * 100:.1f}% | Pos: {r['position']:.1f}")
+            context_lines.append("")
+
+        # 2. Top 5 Pages
+        top_pages = _query_gsc(['page'], 5)
+        if top_pages:
+            context_lines.append("--- Top 5 Organic Landing Pages ---")
+            for r in top_pages:
+                context_lines.append(f"Page: {r['keys'][0]} | Clicks: {r['clicks']} | Imp: {r['impressions']} | CTR: {r['ctr'] * 100:.1f}% | Pos: {r['position']:.1f}")
+            context_lines.append("")
+
+        # 3. Top 5 Query + Page Matrix
+        top_matrix = _query_gsc(['query', 'page'], 5)
+        if top_matrix:
+            context_lines.append("--- Top 5 Query + Page Combinations ---")
+            for r in top_matrix:
+                context_lines.append(f"Query: '{r['keys'][0]}' -> Page: {r['keys'][1]} | Clicks: {r['clicks']} | Pos: {r['position']:.1f}")
+            context_lines.append("")
+
+        # 4. Device x Country breakdown (Top 5 per device)
+        device_country = _query_gsc(['device', 'country'], 10)
+        if device_country:
+            context_lines.append("--- Organic Traffic by Device & Country (Top Segments) ---")
+            for r in device_country:
+                context_lines.append(f"Device: {r['keys'][0].upper()} | Country: {r['keys'][1].upper()} | Clicks: {r['clicks']} | Imp: {r['impressions']}")
+            context_lines.append("")
+
+        context_lines.append("=== End of GSC Data ===")
+        return "\n".join(context_lines)
+
+    except Exception as ex:
+        logging.exception("Failed to fetch GSC context for property %s", site_url)
+        return f"[Could not fetch GSC data for property {site_url}: {str(ex)}]"
+
+
+# -----------------------------------------------
 # Google Ads Context for AI
 # -----------------------------------------------
 
@@ -577,6 +648,13 @@ def ai_chat():
             ga_context = _get_ga_context_for_ai(str(ga_property_id))
             if ga_context:
                 context_parts.append(ga_context)
+
+        # Google Search Console context
+        gsc_property_url = body.get("gsc_property_url")
+        if gsc_property_url:
+            gsc_context = _get_gsc_context_for_ai(gsc_property_url)
+            if gsc_context:
+                context_parts.append(gsc_context)
 
         # Get or create conversation
         if conversation_id:
