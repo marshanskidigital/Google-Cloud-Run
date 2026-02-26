@@ -165,7 +165,7 @@ def _list_direct_child_accounts(client: GoogleAdsClient) -> List[Dict[str, Any]]
 def _fetch_campaigns_for_account(client: GoogleAdsClient, customer_id: str) -> List[Dict[str, Any]]:
     ga_service = client.get_service("GoogleAdsService")
 
-    # מדדים בסיסיים ב-30 ימים אחרונים (LAST_30_DAYS)
+    # מדדים בסיסיים ב-30 ימים אחרונים — רק קמפיינים עם הוצאה בפועל
     query = f"""
         SELECT
           customer.id,
@@ -180,7 +180,8 @@ def _fetch_campaigns_for_account(client: GoogleAdsClient, customer_id: str) -> L
           metrics.conversions
         FROM campaign
         WHERE segments.date DURING LAST_30_DAYS
-        ORDER BY metrics.impressions DESC
+          AND metrics.cost_micros > 0
+        ORDER BY metrics.cost_micros DESC
         LIMIT {MAX_CAMPAIGNS_PER_ACCOUNT}
     """
 
