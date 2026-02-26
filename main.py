@@ -474,23 +474,39 @@ def _get_gsc_context_for_ai(site_url: str) -> str:
 # Google Tag Manager Context for AI
 # -----------------------------------------------
 
-def _get_gtm_context_for_ai(container_path: str) -> str:
+def _get_gtm_context_for_ai(account_id: str, public_id: str) -> str:
     """
     Fetch Google Tag Manager tags, triggers, and variables for a container
     and format them as text context for Claude.
-    container_path format: 'accounts/{account_id}/containers/{container_id}'
+    account_id: GTM account ID (numeric)
+    public_id: Public container ID like 'GTM-NCJ9SK9Z'
     """
     try:
         credentials, project = google.auth.default(scopes=['https://www.googleapis.com/auth/tagmanager.readonly'])
         service = build('tagmanager', 'v2', credentials=credentials)
 
-        # Get the live (published) version of the container
+        # Step 1: List containers under this account to find the numeric container ID
+        account_path = f"accounts/{account_id}"
+        containers_response = service.accounts().containers().list(parent=account_path).execute()
+        containers = containers_response.get('container', [])
+
+        # Find the container matching the public ID (e.g. GTM-NCJ9SK9Z)
+        container_path = None
+        for c in containers:
+            if c.get('publicId', '').upper() == public_id.upper():
+                container_path = c.get('path')  # e.g. accounts/123/containers/456
+                break
+
+        if not container_path:
+            return f"[GTM container {public_id} not found under account {account_id}. Available: {[c.get('publicId') for c in containers]}]"
+
+        # Step 2: Get the live (published) version of the container
         live = service.accounts().containers().versions().live(
             parent=container_path
         ).execute()
 
         context_lines = [
-            f"=== Google Tag Manager Data for {container_path} ===",
+            f"=== Google Tag Manager Data ({public_id}) ===",
             f"Container Version: {live.get('containerVersionId', 'N/A')}",
             ""
         ]
@@ -550,8 +566,8 @@ def _get_gtm_context_for_ai(container_path: str) -> str:
         return "\n".join(context_lines)
 
     except Exception as ex:
-        logging.exception("Failed to fetch GTM context for %s", container_path)
-        return f"[Could not fetch GTM data for {container_path}: {str(ex)}]"
+        logging.exception("Failed to fetch GTM context for %s / %s", account_id, public_id)
+        return f"[Could not fetch GTM data for {public_id}: {str(ex)}]"
 
 
 # -----------------------------------------------
@@ -742,9 +758,10 @@ def ai_chat():
                 context_parts.append(gsc_context)
 
         # Google Tag Manager context
-        gtm_container_path = body.get("gtm_container_path")
-        if gtm_container_path:
-            gtm_context = _get_gtm_context_for_ai(gtm_container_path)
+        gtm_account_id = body.get("gtm_account_id")
+        gtm_public_id = body.get("gtm_public_id")
+        if gtm_account_id and gtm_public_id:
+            gtm_context = _get_gtm_context_for_ai(gtm_account_id, gtm_public_id)
             if gtm_context:
                 context_parts.append(gtm_context)
 
