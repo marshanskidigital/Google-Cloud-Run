@@ -46,8 +46,8 @@ GOOGLE_ADS_REFRESH_TOKEN = os.getenv("GOOGLE_ADS_REFRESH_TOKEN")
 GOOGLE_ADS_MCC_ID = os.getenv("GOOGLE_ADS_MCC_ID")
 
 # הגבלות כדי לא להיתקע על TIMEOUT
-MAX_ACCOUNTS = int(os.getenv("MAX_ACCOUNTS", "50"))                 # כמה חשבונות למשוך מתחת ל-MCC
-MAX_CAMPAIGNS_PER_ACCOUNT = int(os.getenv("MAX_CAMPAIGNS_PER_ACCOUNT", "200"))  # כמה קמפיינים לכל חשבון
+MAX_ACCOUNTS = int(os.getenv("MAX_ACCOUNTS", "10"))                 # כמה חשבונות למשוך מתחת ל-MCC
+MAX_CAMPAIGNS_PER_ACCOUNT = int(os.getenv("MAX_CAMPAIGNS_PER_ACCOUNT", "30"))  # כמה קמפיינים לכל חשבון
 
 # Claude AI (Anthropic)
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
