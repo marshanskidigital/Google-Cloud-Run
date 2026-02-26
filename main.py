@@ -60,11 +60,12 @@ CLAUDE_MAX_TOKENS = int(os.getenv("CLAUDE_MAX_TOKENS", "4096"))
 CLAUDE_SYSTEM_PROMPT = """You are a senior marketing strategist and growth expert. You specialize in:
 - Google Ads campaign strategy, optimization, and performance analysis
 - SEO and organic search performance (Google Search Console data)
+- Google Tag Manager configuration analysis (tracking audit, conversion setup, remarketing tags)
 - Lead generation and CRM strategies
 - Conversion rate optimization (CRO)
 - Cross-channel marketing analysis (comparing Paid vs. Organic performance)
 
-When provided with data context (Google Ads, Google Analytics, Google Search Console), analyze it deeply to provide actionable insights. If you see organic search data, use it to inform your paid strategy (e.g., "this page ranks well organically, let's use it as a landing page for ads").
+When provided with data context (Google Ads, Google Analytics, Google Search Console, Google Tag Manager), analyze it deeply to provide actionable insights. If you see organic search data, use it to inform your paid strategy. If you see GTM data, identify tracking gaps and suggest improvements (e.g., missing conversion tags, remarketing opportunities).
 Always answer in the language the user speaks to you (usually Hebrew).
 Keep answers concise, professional, and directly useful."""
 
@@ -470,6 +471,90 @@ def _get_gsc_context_for_ai(site_url: str) -> str:
 
 
 # -----------------------------------------------
+# Google Tag Manager Context for AI
+# -----------------------------------------------
+
+def _get_gtm_context_for_ai(container_path: str) -> str:
+    """
+    Fetch Google Tag Manager tags, triggers, and variables for a container
+    and format them as text context for Claude.
+    container_path format: 'accounts/{account_id}/containers/{container_id}'
+    """
+    try:
+        credentials, project = google.auth.default(scopes=['https://www.googleapis.com/auth/tagmanager.readonly'])
+        service = build('tagmanager', 'v2', credentials=credentials)
+
+        # Get the live (published) version of the container
+        live = service.accounts().containers().versions().live(
+            parent=container_path
+        ).execute()
+
+        context_lines = [
+            f"=== Google Tag Manager Data for {container_path} ===",
+            f"Container Version: {live.get('containerVersionId', 'N/A')}",
+            ""
+        ]
+
+        # --- 1. Tags ---
+        tags = live.get('tag', [])
+        triggers = live.get('trigger', [])
+        variables = live.get('variable', [])
+
+        # Build trigger ID -> name lookup
+        trigger_map = {}
+        for t in triggers:
+            trigger_map[t.get('triggerId', '')] = t.get('name', 'Unknown')
+
+        if tags:
+            context_lines.append(f"--- All Tags ({len(tags)}) ---")
+            for tag in tags:
+                tag_name = tag.get('name', 'Unnamed')
+                tag_type = tag.get('type', 'Unknown')
+                paused = ' [PAUSED]' if tag.get('paused') else ''
+
+                # Get firing triggers
+                firing_ids = tag.get('firingTriggerId', [])
+                firing_names = [trigger_map.get(tid, f'ID:{tid}') for tid in firing_ids]
+                fires_on = ', '.join(firing_names) if firing_names else 'No trigger'
+
+                context_lines.append(f"Tag: {tag_name} | Type: {tag_type}{paused} | Fires on: {fires_on}")
+            context_lines.append("")
+
+        # --- 2. Triggers ---
+        if triggers:
+            context_lines.append(f"--- All Triggers ({len(triggers)}) ---")
+            for t in triggers:
+                t_name = t.get('name', 'Unnamed')
+                t_type = t.get('type', 'Unknown')
+                # Get filter conditions if present
+                filters = t.get('filter', [])
+                conditions = []
+                for f in filters:
+                    param = f.get('parameter', [])
+                    if len(param) >= 2:
+                        conditions.append(f"{param[0].get('value', '?')} {f.get('type', '?')} {param[1].get('value', '?')}")
+                cond_str = f" | Conditions: {'; '.join(conditions)}" if conditions else ''
+                context_lines.append(f"Trigger: {t_name} | Type: {t_type}{cond_str}")
+            context_lines.append("")
+
+        # --- 3. Custom Variables ---
+        if variables:
+            context_lines.append(f"--- Custom Variables ({len(variables)}) ---")
+            for v in variables:
+                v_name = v.get('name', 'Unnamed')
+                v_type = v.get('type', 'Unknown')
+                context_lines.append(f"Variable: {v_name} | Type: {v_type}")
+            context_lines.append("")
+
+        context_lines.append("=== End of GTM Data ===")
+        return "\n".join(context_lines)
+
+    except Exception as ex:
+        logging.exception("Failed to fetch GTM context for %s", container_path)
+        return f"[Could not fetch GTM data for {container_path}: {str(ex)}]"
+
+
+# -----------------------------------------------
 # Google Ads Context for AI
 # -----------------------------------------------
 
@@ -655,6 +740,13 @@ def ai_chat():
             gsc_context = _get_gsc_context_for_ai(gsc_property_url)
             if gsc_context:
                 context_parts.append(gsc_context)
+
+        # Google Tag Manager context
+        gtm_container_path = body.get("gtm_container_path")
+        if gtm_container_path:
+            gtm_context = _get_gtm_context_for_ai(gtm_container_path)
+            if gtm_context:
+                context_parts.append(gtm_context)
 
         # Get or create conversation
         if conversation_id:
