@@ -51,7 +51,7 @@ MAX_CAMPAIGNS_PER_ACCOUNT = int(os.getenv("MAX_CAMPAIGNS_PER_ACCOUNT", "200"))  
 
 # Claude AI (Anthropic)
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
-CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-opus-4-20250514")
+CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-sonnet-4-20250514")
 CLAUDE_MAX_TOKENS = int(os.getenv("CLAUDE_MAX_TOKENS", "4096"))
 
 CLAUDE_SYSTEM_PROMPT = """You are a senior marketing strategist and growth expert. You specialize in:
@@ -607,11 +607,14 @@ def ai_chat():
 
         # Call Claude
         client = _get_anthropic_client()
+        total_chars = sum(len(m["content"]) for m in messages_for_claude)
+        logging.info("Calling Claude model=%s, messages=%d, total_chars=%d", CLAUDE_MODEL, len(messages_for_claude), total_chars)
         response = client.messages.create(
             model=CLAUDE_MODEL,
             max_tokens=CLAUDE_MAX_TOKENS,
             system=CLAUDE_SYSTEM_PROMPT,
             messages=messages_for_claude,
+            timeout=120.0,  # 120s timeout for the API call
         )
 
         assistant_message = response.content[0].text
