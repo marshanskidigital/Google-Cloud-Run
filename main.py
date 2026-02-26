@@ -20,7 +20,16 @@ from google.analytics.data_v1beta.types import (
 logging.basicConfig(level=logging.INFO)
 
 app = Flask(__name__)
-CORS(app)
+CORS(app, resources={r"/*": {"origins": "*"}}, supports_credentials=False)
+
+
+@app.after_request
+def add_cors_headers(response):
+    """Ensure CORS headers are present on EVERY response, including errors."""
+    response.headers.setdefault("Access-Control-Allow-Origin", "*")
+    response.headers.setdefault("Access-Control-Allow-Headers", "Content-Type, Authorization")
+    response.headers.setdefault("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+    return response
 
 
 # -----------------------------
@@ -629,8 +638,10 @@ def ai_chat():
         })
 
     except Exception as ex:
-        logging.exception("Failed /ai-chat")
-        return jsonify({"ok": False, "error": str(ex)}), 500
+        logging.exception("Failed /ai-chat: %s", str(ex))
+        resp = jsonify({"ok": False, "error": str(ex)})
+        resp.headers["Access-Control-Allow-Origin"] = "*"
+        return resp, 500
 
 
 @app.route("/ai-chat/conversations", methods=["GET", "OPTIONS"])
