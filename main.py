@@ -802,7 +802,7 @@ def ai_chat():
             max_tokens=CLAUDE_MAX_TOKENS,
             system=CLAUDE_SYSTEM_PROMPT,
             messages=messages_for_claude,
-            timeout=120.0,  # 120s timeout for the API call
+            timeout=300.0,  # 300s timeout for the API call
         )
 
         assistant_message = response.content[0].text
